@@ -27,3 +27,44 @@ Distinct services: Streams = real-time, consumer-managed, shard-based, **not fre
 ## DMS / CDC
 
 DMS replicates changes with an Op flag (I/U/D) in its S3 output files — the raw material downstream SCD logic consumes.
+
+## S3 CRR vs. event-driven cross-region copy
+
+**Concept.** S3 Cross-Region Replication (CRR) is native, automatic, zero-compute
+replication: enable versioning, define a replication rule, done. An SNS → SQS →
+Lambda pipeline doing `copy_object` re-implements this with owned code.
+
+**The why (curriculum gap).** DEA's DMS project uses the event-driven pipeline for
+pure copy — no transformation. That's a teaching choice: the SNS/SQS/Lambda fan-out
+pattern is the canonical AWS event architecture (SNS = fan-out to many subscribers;
+SQS = durability, retry, backpressure). The stated problem is a CRR problem.
+
+**Production framing.** The pipeline earns its complexity only with transformation,
+routing, fan-out, or downstream triggering in the replication path. Caveats worth
+knowing: CRR requires versioning, only replicates objects created after the rule
+exists (backfill = S3 Batch Replication), and its retry internals are opaque —
+the custom pipeline's DLQ/metrics visibility is its one honest advantage. Cost is
+mostly a wash (inter-region transfer dominates either way); the real difference is
+operational surface.
+
+**Interview one-liner.** "If bytes just need to exist in two regions, CRR — zero
+code to operate. The event pipeline is justified only when the copy path needs
+compute."
+
+## CDC to S3: real-time capture ≠ real-time files
+
+**Concept.** CDC (e.g., DMS reading the transaction log) captures every change in
+real time — near-zero source load, sees deletes (Op flag I/U/D), preserves
+intermediate states that periodic extracts miss. But flushing one file per change
+creates the small-file problem: task overhead in Spark, per-file costs in
+Athena/Glue listing and Snowpipe ingestion.
+
+**The why.** "Real-time" describes the capture layer, not the write cadence. DMS's
+S3 target has micro-batching settings (`cdcMaxBatchInterval`, `cdcMinFileSize`)
+that buffer changes and flush on time-or-size thresholds — same buffer-then-flush
+idea as Firehose. Residual small files get fixed by periodic compaction (why Delta
+Lake has `OPTIMIZE`).
+
+**Interview one-liner.** "You almost never want real-time files — buffer at the
+delivery layer, trading seconds of latency for sane file sizes, because small
+files tax every downstream consumer."
