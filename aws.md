@@ -1,70 +1,110 @@
 # AWS
 
-## IAM: authentication vs. authorization
+## Lambda — Docker image deployment (ECR)
 
-**Concept.** `aws configure` stores an access key pair → boto3 authenticates → AWS knows *who* you are. Whether you can *do* anything is a separate check against identity-based policies attached to the user/group/role. `AccessDenied` means authN succeeded, authZ failed (`InvalidAccessKeyId` / `SignatureDoesNotMatch` = authN failed).
+Lambda originally had a 250MB deployment package limit. Docker image support raised that to 10GB, which removed the constraint for data engineering dependencies (pandas, Snowflake connectors, psycopg2, etc.) that blow past the original limit. Docker Lambda is now the professional standard for anything data-adjacent.
 
-**Real incident.** `S3UploadFailedError ... not authorized to perform: s3:PutObject ... because no identity-based policy allows` — fixed by attaching a scoped policy to the IAM user. No credential changes needed; policy changes take effect in seconds.
+### The three services involved
 
-**Least-privilege pattern.** Scope to the bucket, and note the Resource split: `s3:ListBucket` applies to the bucket ARN, `s3:PutObject`/`GetObject` apply to `arn:...:bucket/*`. Mixing those up causes confusing partial-access errors.
+- **Docker** — builds the image on your local machine
+- **ECR (Elastic Container Registry)** — AWS's private Docker registry; Lambda can only pull from ECR, not Docker Hub
+- **Lambda** — pulls the image from ECR at cold start and runs it as a function
 
-**Interview one-liner.** "AccessDenied is an authorization failure, not an authentication one — the fix is a policy grant, not new credentials, and least privilege means scoping actions and resources, not attaching S3FullAccess."
+### Full deployment workflow
 
-**Bonus trace-reading detail.** boto3 auto-switches to multipart upload above ~8 MB — a failure on `CreateMultipartUpload` vs. `PutObject` hints at file size, same root cause.
+```bash
+# 1. Build locally using AWS's base image (provides LAMBDA_TASK_ROOT, runtime shims)
+docker build -t my-function .
 
-## S3 as the universal decoupling / replay layer
+# 2. Create ECR repository — returns the repository URI
+aws ecr create-repository --repository-name my-function
 
-Landing everything in S3 between pipeline stages decouples producers from consumers, enables replay/backfill, and is dirt cheap relative to compute. Cost of the pattern: data multiplies across stages (raw copy, transformed copy, warehouse copy) — storage multiplication is a real line item to acknowledge.
+# 3. Authenticate Docker to ECR (short-lived token, not a stored credential)
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin \
+  123456789.dkr.ecr.us-east-1.amazonaws.com
 
-## Glue vs. Lambda vs. managed connectors for extraction
+# 4. Tag local image with ECR URI (aliasing, not copying)
+docker tag my-function:latest \
+  123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest
 
-For API → S3 extraction: Glue **Python Shell** jobs (not Spark jobs) fit small/medium pulls; Lambda fits if payload and runtime fit its limits (15-min max); Fivetran/managed connectors trade money for zero ops. Choosing Spark-sized tools for API pulls is over-provisioning — the workload defines the tool.
+# 5. Push to ECR
+docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest
 
-## Kinesis Data Streams vs. Firehose
+# 6. Create Lambda function from ECR image
+aws lambda create-function \
+  --function-name my-function \
+  --package-type Image \
+  --code ImageUri=123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest \
+  --role arn:aws:iam::123456789:role/lambda-execution-role
+```
 
-Distinct services: Streams = real-time, consumer-managed, shard-based, **not free-tier eligible** (watch spend on DEA projects); Firehose = near-real-time managed delivery to S3/Redshift/etc. Firehose was renamed **Amazon Data Firehose** (late 2023) — use current name in interviews.
+### Updating the function
 
-## DMS / CDC
+Lambda does not auto-detect a new push to ECR. You must explicitly tell it to update — this trips people up the first time.
 
-DMS replicates changes with an Op flag (I/U/D) in its S3 output files — the raw material downstream SCD logic consumes.
+```bash
+docker build -t my-function .
+docker tag my-function:latest \
+  123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest
+docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest
 
-## S3 CRR vs. event-driven cross-region copy
+aws lambda update-function-code \
+  --function-name my-function \
+  --image-uri 123456789.dkr.ecr.us-east-1.amazonaws.com/my-function:latest
+```
 
-**Concept.** S3 Cross-Region Replication (CRR) is native, automatic, zero-compute
-replication: enable versioning, define a replication rule, done. An SNS → SQS →
-Lambda pipeline doing `copy_object` re-implements this with owned code.
+### Dockerfile pattern for Lambda
 
-**The why (curriculum gap).** DEA's DMS project uses the event-driven pipeline for
-pure copy — no transformation. That's a teaching choice: the SNS/SQS/Lambda fan-out
-pattern is the canonical AWS event architecture (SNS = fan-out to many subscribers;
-SQS = durability, retry, backpressure). The stated problem is a CRR problem.
+```dockerfile
+FROM public.ecr.aws/lambda/python:3.11
 
-**Production framing.** The pipeline earns its complexity only with transformation,
-routing, fan-out, or downstream triggering in the replication path. Caveats worth
-knowing: CRR requires versioning, only replicates objects created after the rule
-exists (backfill = S3 Batch Replication), and its retry internals are opaque —
-the custom pipeline's DLQ/metrics visibility is its one honest advantage. Cost is
-mostly a wash (inter-region transfer dominates either way); the real difference is
-operational surface.
+COPY requirements.txt .
+RUN pip install -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
 
-**Interview one-liner.** "If bytes just need to exist in two regions, CRR — zero
-code to operate. The event pipeline is justified only when the copy path needs
-compute."
+COPY lambda_function.py "${LAMBDA_TASK_ROOT}"
 
-## CDC to S3: real-time capture ≠ real-time files
+CMD ["lambda_function.lambda_handler"]
+```
 
-**Concept.** CDC (e.g., DMS reading the transaction log) captures every change in
-real time — near-zero source load, sees deletes (Op flag I/U/D), preserves
-intermediate states that periodic extracts miss. But flushing one file per change
-creates the small-file problem: task overhead in Spark, per-file costs in
-Athena/Glue listing and Snowpipe ingestion.
+`LAMBDA_TASK_ROOT` is provided by AWS's base image — it is the directory Lambda expects your code in. This is why you use AWS's base image rather than a generic Python one.
 
-**The why.** "Real-time" describes the capture layer, not the write cadence. DMS's
-S3 target has micro-batching settings (`cdcMaxBatchInterval`, `cdcMinFileSize`)
-that buffer changes and flush on time-or-size thresholds — same buffer-then-flush
-idea as Firehose. Residual small files get fixed by periodic compaction (why Delta
-Lake has `OPTIMIZE`).
+### Key tradeoff (interview framing)
 
-**Interview one-liner.** "You almost never want real-time files — buffer at the
-delivery layer, trading seconds of latency for sane file sizes, because small
-files tax every downstream consumer."
+Docker Lambda trades slightly slower cold starts (larger image = longer pull time) for full environment control, reproducible builds, and the 10GB size ceiling. Direct zip deployment is still reasonable for lightweight functions with no heavy dependencies.
+
+---
+
+## API authentication — 401 vs 403, scoped tokens, trust the error contract
+
+Learned through Calendly API integration but applies universally across AWS, Snowflake, GitHub, and most modern APIs.
+
+### Two-layer auth model
+
+Nearly every modern API enforces authentication and authorization as separate concerns:
+
+- **401 Unauthorized** — identity not established. The token is missing, expired, or invalid. The system does not know who you are.
+- **403 Forbidden** — identity established, action not permitted. The token is valid but the policy attached to that identity does not allow this operation.
+
+The Calendly error `{'title': 'Insufficient scope', 'required_scopes': ['users:read']}` is a 403-class error. Authentication succeeded; authorization failed. This is exactly the same pattern as AWS `AccessDenied` on a valid IAM identity — valid credentials do not guarantee authorized access.
+
+### Scoped tokens (least privilege in practice)
+
+Modern APIs issue tokens with explicit scopes defining what they can do. A token with no scopes is technically valid but cannot call any endpoint. This is least-privilege design: the platform refuses to guess what permissions you need.
+
+Calendly added mandatory scopes to personal access tokens after their original documentation was written — older tokens had implicit full access. The docs were not updated consistently, which meant:
+- The how-to page described token creation without mentioning scopes
+- The endpoint reference listed `Required scopes: users:read` with no link to where you set them
+- The UI allowed creating a zero-scope token with no warning
+
+This is the signature of a feature bolted onto an existing auth model mid-product lifecycle. Common across API platforms.
+
+### Trust the error contract over the docs
+
+When docs and runtime behavior diverge, the API's error response is the source of truth — it is generated by the actual authorization code, not written by a docs team. `required_scopes: ['users:read']` told exactly what was missing, more precisely than any documentation page.
+
+Habit: read the full error response before consulting docs. The error is the system explaining itself.
+
+### Interview framing
+
+"I got a 403 with a `required_scopes` field rather than a 401, which told me authentication had succeeded and the issue was authorization — same two-layer pattern as IAM. I read the error contract directly rather than the docs, because the error is generated by the authorization code and the docs had not caught up to a breaking change in the token creation flow."
